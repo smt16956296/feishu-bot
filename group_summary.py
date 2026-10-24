@@ -237,7 +237,12 @@ def _call_summary_session(prompt: str, timeout: int = 240) -> str:
             for item in events:
                 ev = item.get("event", {})
                 if ev.get("type") == "user/message" and ev.get("seq", 0) > before_seq:
-                    content = ev.get("data", {}).get("message", {}).get("content", [])
+                    # 2026-10-24 修复：DSH 升级后 user/message 的正文在 data.content，
+                    # 而 assistant/message 仍在 data.message.content（两者结构不同）。
+                    # 旧代码只读 data.message.content，导致 prompt_seq 永远定位不到、
+                    # 死等满 timeout 后误判"LLM 总结失败"（日报漏群根因）。
+                    _d = ev.get("data") or {}
+                    content = _d.get("message", {}).get("content") or _d.get("content") or []
                     texts = [c.get("text", "") for c in content if c.get("type") == "text"]
                     if "".join(texts).strip().startswith("你是团队沟通总结助手"):
                         prompt_seq = ev.get("seq", 0)
