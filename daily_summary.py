@@ -4,7 +4,6 @@
     py -3 daily_summary.py                # 总结今天并推送
     py -3 daily_summary.py --day 2026-10-19   # 指定日期
     py -3 daily_summary.py --dry-run      # 只打印不推送
-    py -3 daily_summary.py --no-llm       # 用本地规则摘要（不调 LLM）
     py -3 daily_summary.py --force        # 忽略去重，强制推送
 """
 import argparse
@@ -48,7 +47,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="生成并推送群聊日报")
     parser.add_argument("--day", default="", help="日期 YYYY-MM-DD，缺省今天")
     parser.add_argument("--dry-run", action="store_true", help="只打印不推送")
-    parser.add_argument("--no-llm", action="store_true", help="用本地规则摘要")
     parser.add_argument("--force", action="store_true", help="忽略去重强制推送")
     args = parser.parse_args()
 
@@ -71,7 +69,7 @@ def main() -> int:
     for t in targets:
         print("[INFO]   - %s (%s)" % (t.get("name", ""), t.get("chat_id", "")), file=sys.stderr)
 
-    body = group_summary.build_all_summaries(day, use_llm=not args.no_llm)
+    body = group_summary.build_all_summaries(day)
 
     if not body:
         print("[INFO] 今日所有群均无消息，无需推送", file=sys.stderr)

@@ -1,6 +1,4 @@
-' 飞书机器人后台启动脚本（无窗口）
-' 双击即可在后台运行，不显示黑色控制台窗口
+' Feishu bot background launcher (hidden window, via start_bot.ps1 with guard+log)
 Set WshShell = CreateObject("WScript.Shell")
-WshShell.CurrentDirectory = "E:\feishu-bot"
-WshShell.Run """C:\Users\shenmengting\AppData\Local\Programs\Python\Python312\pythonw.exe"" bot.py", 0, False
+WshShell.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File E:\feishu-bot\start_bot.ps1", 0, False
 Set WshShell = Nothing

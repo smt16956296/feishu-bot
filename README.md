@@ -72,11 +72,11 @@ DAILY_REPORT_TIME=18:00             # 日报推送时间（24小时制）
 py -3 daily_summary.py                    rem 总结今天并推送
 py -3 daily_summary.py --day 2026-10-19   rem 指定日期
 py -3 daily_summary.py --dry-run          rem 只打印不推送
-py -3 daily_summary.py --no-llm           rem 用本地规则摘要（不调 LLM）
 ```
 
 **总结内容**：三段式 ——【今日要点】【待办与跟进】【风险与阻塞】，由 DSH LLM 生成。
-LLM 不可用时自动降级为本地规则摘要（按人统计 + 关键词提取），保证功能不中断。
+LLM 失败时该群跳过并记日志（本地规则摘要降级已于 2026-10-22 按用户要求停用，
+收割超时同日从 240 秒提到 600 秒）。
 
 **关键设计**：
 - 用**独立的 DSH 总结会话**（`data/summary_session_id.txt`），不占用交互会话，

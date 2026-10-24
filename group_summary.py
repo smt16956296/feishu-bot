@@ -6,10 +6,12 @@
   3. data/summary_targets.json —— 手工配置（可选，用于排除/改名）
 
 总结策略：
-  1. 优先用 DSH 的 LLM 做智能总结（理解语义、提炼待办与结论）
-  2. LLM 不可用时降级为本地规则摘要，保证功能不中断
+  仅用 DSH 的 LLM 做智能总结（理解语义、提炼待办与结论）。
+  2026-10-22 按用户要求停用本地规则摘要降级：LLM 失败则该群跳过并记日志，
+  不再用关键词拼凑的兜底版本（噪音大、可读性差）。
 """
 import json
+import logging
 import os
 import re
 from datetime import datetime
@@ -18,16 +20,13 @@ from config import DATA_DIR
 from name_map import learn_from_messages, display_name
 from storage import get_messages
 
+logger = logging.getLogger(__name__)
+
 KNOWN_CHATS_FILE = os.path.join(DATA_DIR, "known_chats.json")
 GROUP_CONFIG_FILE = os.path.join(DATA_DIR, "summary_targets.json")
 
 # 软算群（兼容旧配置的默认值）
 DEFAULT_GROUP_ID = "oc_90da6b0826ebe9967c62c5a8769e9453"
-
-# 待办/结论类关键词，用于本地降级摘要
-_TODO_HINTS = ("需要", "待", "跟进", "确认", "安排", "解决", "修复", "处理",
-               "抓紧", "急", "截止", "发布", "提供", "同步", "评审", "复现")
-_DONE_HINTS = ("已", "完成", "修复了", "发布了", "搞定", "好了", "没问题")
 
 
 # ---------------- 群发现 ----------------
@@ -153,52 +152,6 @@ def collect_group_messages(chat_id: str, day: str) -> list:
     return out
 
 
-def _rule_based_summary(msgs: list, group_name: str, day: str) -> str:
-    """本地规则摘要（LLM 不可用时的降级方案）。"""
-    if not msgs:
-        return ""
-
-    senders = {}
-    for m in msgs:
-        senders[m["sender"]] = senders.get(m["sender"], 0) + 1
-
-    todos, dones = [], []
-    for m in msgs:
-        text = m["text"]
-        if any(h in text for h in _TODO_HINTS):
-            todos.append(m)
-        elif any(h in text for h in _DONE_HINTS):
-            dones.append(m)
-
-    lines = []
-    lines.append("【%s · 聊天总结】%s" % (group_name, day))
-    lines.append("共 %d 条消息，%d 人参与。" % (len(msgs), len(senders)))
-    lines.append("")
-    lines.append("一、参与人：")
-    for name, cnt in sorted(senders.items(), key=lambda x: -x[1]):
-        lines.append("  · %s：%d 条" % (name, cnt))
-
-    if todos:
-        lines.append("")
-        lines.append("二、待办 / 需跟进：")
-        for m in todos[:15]:
-            t = m["text"]
-            if len(t) > 60:
-                t = t[:60] + "…"
-            lines.append("  · [%s] %s：%s" % (m["time"], m["sender"], t))
-
-    if dones:
-        lines.append("")
-        lines.append("三、已完成 / 已确认：")
-        for m in dones[:10]:
-            t = m["text"]
-            if len(t) > 60:
-                t = t[:60] + "…"
-            lines.append("  · [%s] %s：%s" % (m["time"], m["sender"], t))
-
-    return "\n".join(lines)
-
-
 def _llm_summary(msgs: list, group_name: str, day: str) -> str:
     """调用 DSH LLM 做智能总结。失败返回空串。
 
@@ -221,8 +174,11 @@ def _llm_summary(msgs: list, group_name: str, day: str) -> str:
             "对任务的说明、对自身行为的解释（例如“以上为”“本轮先”“我会”等一律不要）。\n\n"
             "聊天记录：\n%s" % (group_name, day, convo)
         )
-        reply = _call_summary_session(prompt, timeout=240)
-        if reply and len(reply.strip()) > 20:
+        # 2026-10-22：240 秒太紧——当天两群 sequential 各等满 240 秒全降级
+        # （实测 18:30:04→18:38:09 恰好 2×240s）。总结会话排队 + 单轮生成
+        # 可能超 4 分钟，收割窗口提到 600 秒。
+        reply = _call_summary_session(prompt, timeout=600)
+        if reply and len(reply.strip()) > 20 and "【今日要点】" in reply:
             return reply.strip()
     except Exception:
         pass
@@ -267,39 +223,60 @@ def _call_summary_session(prompt: str, timeout: int = 240) -> str:
     if not r.get("result", {}).get("ok"):
         return ""
 
+    # 2026-10-22 修复：queue 模式下 prompt 可能被 DSH 运行时上下文刷新等
+    # 系统 turn 插队，插队回复（如"本轮无新消息，待命中"）曾被误当成总结。
+    # 现在先定位本次 prompt 对应的 user message seq，只接受其之后、且带
+    # 【今日要点】标志（三段式日报固定开头）的回复，其余一律跳过。
+    prompt_seq = 0
     deadline = time.time() + timeout
     while time.time() < deadline:
         time.sleep(3)
         r = dsh_bridge._call("session.history", {"sessionId": sid, "maxMessages": 50})
         events = r.get("result", {}).get("value", {}).get("events", [])
+        if not prompt_seq:
+            for item in events:
+                ev = item.get("event", {})
+                if ev.get("type") == "user/message" and ev.get("seq", 0) > before_seq:
+                    content = ev.get("data", {}).get("message", {}).get("content", [])
+                    texts = [c.get("text", "") for c in content if c.get("type") == "text"]
+                    if "".join(texts).strip().startswith("你是团队沟通总结助手"):
+                        prompt_seq = ev.get("seq", 0)
+                        break
+            if not prompt_seq:
+                continue
         for item in events:
             ev = item.get("event", {})
-            if ev.get("type") == "assistant/message" and ev.get("seq", 0) > before_seq:
+            if ev.get("type") == "assistant/message" and ev.get("seq", 0) > prompt_seq:
                 msg = ev.get("data", {}).get("message", {})
                 content = msg.get("content", [])
                 texts = [c.get("text", "") for c in content if c.get("type") == "text"]
                 reply = "".join(texts).strip()
-                if reply:
+                if reply and "【今日要点】" in reply:
                     return reply
     return ""
 
 
 def build_group_summary(chat_id: str, group_name: str, day: str = None,
                         use_llm: bool = True) -> str:
-    """生成某群某天的聊天总结；当天无消息返回空串（不占篇幅）。"""
+    """生成某群某天的聊天总结；当天无消息返回空串（不占篇幅）。
+
+    仅走 LLM 总结（use_llm 参数保留只为兼容旧调用，取值不再影响行为）：
+    LLM 失败返回空串并记日志——本地规则摘要降级已于 2026-10-22 停用。
+    """
     if day is None:
         day = datetime.now().strftime("%Y-%m-%d")
     msgs = collect_group_messages(chat_id, day)
     if not msgs:
         return ""
 
-    if use_llm:
-        s = _llm_summary(msgs, group_name, day)
-        if s:
-            header = "【%s】%d 条消息\n\n" % (group_name, len(msgs))
-            return header + s
+    s = _llm_summary(msgs, group_name, day)
+    if s:
+        header = "【%s】%d 条消息\n\n" % (group_name, len(msgs))
+        return header + s
 
-    return _rule_based_summary(msgs, group_name, day)
+    logger.warning("群「%s」LLM 总结失败，跳过该群（规则摘要降级已停用）",
+                   group_name)
+    return ""
 
 
 def build_all_summaries(day: str = None, use_llm: bool = True) -> str:
@@ -309,6 +286,7 @@ def build_all_summaries(day: str = None, use_llm: bool = True) -> str:
 
     targets = load_targets()
     sections = []
+    failures = []
     for t in targets:
         cid = t.get("chat_id", "")
         name = t.get("name") or cid
@@ -317,10 +295,18 @@ def build_all_summaries(day: str = None, use_llm: bool = True) -> str:
         s = build_group_summary(cid, name, day, use_llm=use_llm)
         if s:
             sections.append(s)
+        elif collect_group_messages(cid, day):
+            failures.append(name)
 
     if not sections:
+        if failures:
+            return ("【群聊日报】%s\n总结生成失败：%s\n"
+                    "（LLM 未在时限内返回；规则摘要降级已停用，详情见 bot.log）"
+                    % (day, "、".join(failures)))
         return ""
 
     header = "【群聊日报】%s\n共 %d 个群有讨论\n" % (day, len(sections))
     body = "\n\n" + ("\n\n" + "-" * 30 + "\n\n").join(sections)
+    if failures:
+        body += "\n\n（另有群总结失败：%s）" % "、".join(failures)
     return header + body

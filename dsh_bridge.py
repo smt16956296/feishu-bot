@@ -122,12 +122,16 @@ SYSTEM_CONSTRAINT = (
 
 QUESTION_MARK = "【请问】"
 
-def send_message(text, timeout=180):
+def send_message(text, timeout=180, wait_reply=True):
+    """把消息送进 DSH agent 会话。
+
+    wait_reply=False：只入队立即返回（2026-10-22 新增）。bot 不再代收回复——
+    旧取回逻辑只拿回合第一条 assistant/message，会截断后续内容，已弃用；
+    agent 处理完自行用 push.py 把完整回复推送到消息来源。
+    """
     sid = get_or_create_session()
     if not sid:
         return False, "无法创建/获取 DSH 会话"
-
-    before_seq = get_latest_seq(sid)
 
     r = _call("session.prompt", {
         "sessionId": sid,
@@ -136,6 +140,11 @@ def send_message(text, timeout=180):
     }, timeout=30)
     if not r.get("result", {}).get("ok"):
         return False, "消息发送失败: %s" % json.dumps(r.get("result", {}), ensure_ascii=False)[:200]
+
+    if not wait_reply:
+        return True, ""
+
+    before_seq = get_latest_seq(sid)
 
     deadline = time.time() + timeout
     while time.time() < deadline:

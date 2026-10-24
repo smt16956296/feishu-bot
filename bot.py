@@ -367,6 +367,16 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
                 text_for_agent = (text_for_agent + "\n\n[用户附带了 %d 张图片，本地路径：\n%s\n可用 describe_image 或 read_image 工具查看]"
                                   % (len(local_images), "\n".join(local_images))).strip()
             if text_for_agent:
+                # 2026-10-22：消息来源头——bot 已不代发回复，agent 处理完
+                # 必须用 push.py 把完整回复推回来源（群 --chat / 私聊 --to）
+                src_header = "【消息来源】%s chat_id=%s sender=%s(%s) 回复推送=%s\n" % (
+                    "私聊" if is_p2p else "群聊",
+                    record["chat_id"],
+                    sender_name, sender_id,
+                    ("push.py --to %s" % sender_id) if is_p2p
+                    else ("push.py --chat %s" % record["chat_id"]),
+                )
+                text_for_agent = src_header + text_for_agent
                 # 在独立线程处理，避免阻塞消息接收
                 import threading as _th
                 msg_id = record["message_id"]
@@ -383,22 +393,23 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
 
 
 def handle_agent_reply(chat_id, chat_type, sender_id, text, message_id, is_replying=False):
-    """调用 DSH agent 处理消息并回复（在独立线程中运行）。
+    """把消息投递给 DSH agent（在独立线程中运行）。
 
-    收到消息时给原消息贴表情表示处理中。若 agent 输出【请问】标记（向用户提问），
-    则把问题转发给用户并进入"待回答"状态，等用户回复后继续对话。
+    2026-10-22 改版：不再等待/转发 agent 回复。旧逻辑有两大缺陷：
+    1) 只取回合第一条 assistant/message，多轮工具调用的回合只发开头一段（截断）；
+    2) 回复固定私聊发给 sender，群消息的回复群里看不到、私聊却收到，
+       与 agent 自己的 push 推送重复（用户看到两遍）。
+    现在只负责：贴"收到"表情 → 消息入队 → 投递失败时通知用户。
+    agent 处理完成后自行用 push.py 把完整回复推送到消息来源（群 --chat / 私聊 --to）。
     """
     try:
-        # 若是回答上一个问题，不贴"处理中"表情
-        if not is_replying:
-            add_reaction(message_id, "SALUTE")
-            logger.info("已贴处理中表情")
+        add_reaction(message_id, "SALUTE")
+        logger.info("已贴收到表情")
 
-        ok2, reply = dsh_bridge.send_message(text, timeout=180)
+        ok2, err = dsh_bridge.send_message(text, timeout=180, wait_reply=False)
         if not ok2:
-            add_reaction(message_id, "OK")
             # 连接类错误给友好提示，避免用户看到技术堆栈
-            low = (reply or "").lower()
+            low = (err or "").lower()
             if "10061" in low or "refused" in low or "urlopen" in low or "timed out" in low:
                 send_text_to_user(
                     sender_id,
@@ -406,26 +417,9 @@ def handle_agent_reply(chat_id, chat_type, sender_id, text, message_id, is_reply
                     "现在已经恢复了。麻烦再发一次，或者直接说「继续」。"
                 )
             else:
-                send_text_to_user(sender_id, "处理出错: %s" % reply)
+                send_text_to_user(sender_id, "消息投递失败: %s" % err)
             return
-
-        # 若 agent 需要向用户提问
-        if dsh_bridge.is_question(reply):
-            question = dsh_bridge.extract_question(reply)
-            # 标记待回答状态
-            with _pending_lock:
-                _pending_questions[sender_id] = True
-            # 不贴"完成"表情（对话还在继续），把问题发给用户
-            send_text_to_user(sender_id, question)
-            logger.info("agent 提问已转发，等待用户回答: %s", question[:50])
-            return
-
-        # 处理完成：清除待回答状态，追加"完成"表情并发送回复
-        with _pending_lock:
-            _pending_questions.pop(sender_id, None)
-        add_reaction(message_id, "OK")
-        send_text_to_user(sender_id, reply)
-        logger.info("agent 回复已发送")
+        logger.info("消息已投递给 agent，等待 agent 自行推送回复")
     except Exception as e:
         logger.exception("agent 处理出错: %s", e)
         try:
