@@ -216,6 +216,7 @@ def _call_summary_session(prompt: str, timeout: int = 240) -> str:
     before_seq = dsh_bridge.get_latest_seq(sid)
 
     r = dsh_bridge._call("session.prompt", {
+        "requestId": "gs-" + ("%d" % time.time()),  # 0.2.1 必填：客户端自造
         "sessionId": sid,
         "mode": "queue",
         "content": [{"type": "text", "text": prompt}],
@@ -231,8 +232,8 @@ def _call_summary_session(prompt: str, timeout: int = 240) -> str:
     deadline = time.time() + timeout
     while time.time() < deadline:
         time.sleep(3)
-        r = dsh_bridge._call("session.history", {"sessionId": sid, "maxMessages": 50})
-        events = r.get("result", {}).get("value", {}).get("events", [])
+        # 2026-10-26 适配 0.2.1：session.history 已移除，改 projections+page
+        events = dsh_bridge.get_events(sid, max_messages=60)
         if not prompt_seq:
             for item in events:
                 ev = item.get("event", {})

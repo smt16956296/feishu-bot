@@ -2,14 +2,28 @@
 
 通过 DSH web 的 /api 接口（127.0.0.1:3080）向一个持久会话发消息并获取回复。
 会话有完整上下文，agent 具备读代码、跑命令、用 skill 的能力。
+
+2026-10-26 适配 DSH 0.2.1-rc.3（重大协议变更）：
+- API 全部要求鉴权：用 ~/.dsh/.credentials.yaml 的 browser-session secret
+  自签 cookie（v1.payload.hmac，payload 无 id 字段走共享 browserPeer 身份）。
+- RPC 方法名 session.xxx → session/xxx，payload 统一包装 {args:{request:...}}。
+- session.history 移除：拉历史改用 session/projections（拿 asOfSeq 游标）
+  + session/page（throughSeq=游标，返回 {event:{type,seq,data}} 壳结构不变）。
+- session.prompt 新增必填 requestId（客户端自造）。
 """
+import base64
+import hashlib
+import hmac
 import json
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 DSH_BASE = "http://127.0.0.1:3080/api"
 SESSION_ID_FILE = "data/dsh_session_id.txt"
+CREDENTIALS_FILE = r"C:\Users\shenmengting\.dsh\.credentials.yaml"
+AUTHORITY = "127.0.0.1:3080"
 
 DEFAULT_CWD = "E:/feishu-bot"
 AGENT_PRESET = "feishu-bot"
@@ -20,27 +34,88 @@ _MAX_RETRY = 3
 _RETRY_DELAY = 1.5  # 秒，逐次递增
 
 
-def _call(method, payload, timeout=30, retry=None):
-    """调用 DSH API。连接失败自动重试（DSH 处理长任务时可能短暂拒绝连接）。
+# ---------------- 鉴权（0.2.1 browser-session cookie 自签） ----------------
 
+_cookie_cache = {"value": "", "expiresAt": 0}
+
+
+def _b64url(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+
+def _sign_cookie() -> str:
+    """读 browser-session secret 自签 API cookie（共享 browserPeer 身份）。"""
+    import yaml
+    with open(CREDENTIALS_FILE, "r", encoding="utf-8") as f:
+        stored = yaml.safe_load(f)["records"][
+            "client-connection/browser-session"]["payload"]["secret"]
+    secret = base64.urlsafe_b64decode(stored + "=" * (-len(stored) % 4))
+    now = int(time.time() * 1000)
+    expires = now + 20 * 24 * 3600 * 1000  # 20 天，服务端默认 30 天
+    payload = {"version": 1, "authority": AUTHORITY, "issuedAt": now,
+               "expiresAt": expires}
+    body = _b64url(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    sig = _b64url(hmac.new(secret, body.encode("ascii"), hashlib.sha256).digest())
+    name = "dsh-auth-" + _b64url(hashlib.sha256(AUTHORITY.encode()).digest())
+    _cookie_cache["value"] = "%s=v1.%s.%s" % (name, body, sig)
+    _cookie_cache["expiresAt"] = expires
+    return _cookie_cache["value"]
+
+
+def _auth_cookie() -> str:
+    if not _cookie_cache["value"] or time.time() * 1000 > _cookie_cache["expiresAt"] - 3600_000:
+        try:
+            return _sign_cookie()
+        except Exception:
+            return _cookie_cache["value"]  # 签不了就用旧的（可能仍有效）
+    return _cookie_cache["value"]
+
+
+# ---------------- RPC ----------------
+
+def _call(method, payload, timeout=30, retry=None):
+    """调用 DSH API。连接失败自动重试；401 时重签 cookie 再试一次。
+
+    0.2.1：方法名点号自动转斜杠（session.create → session/create），
+    payload 包装为 {args:{request:...}}，兼容旧调用方写法。
     retry: 重试次数，缺省 _MAX_RETRY。传 0 表示不重试。
     """
     attempts = _MAX_RETRY if retry is None else retry
+    wire_method = method.replace(".", "/", 1)
+    wire_payload = {"args": {"request": payload}}
     last_err = None
+    refreshed = False
     for i in range(attempts + 1):
         req = urllib.request.Request(
-            DSH_BASE + "/" + method,
+            DSH_BASE + "/" + wire_method,
             data=json.dumps({
                 "type": "client-request",
-                "rpcId": "fb-" + str(int(time.time() * 1000)),
-                "method": method,
-                "payload": payload,
+                "rpcId": "fb-" + uuid.uuid4().hex[:12],
+                "method": wire_method,
+                "payload": wire_payload,
             }).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "Cookie": _auth_cookie(),
+            },
         )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code == 401 and not refreshed:
+                # secret 可能轮换过，重签一次
+                _cookie_cache["value"] = ""
+                refreshed = True
+                try:
+                    _sign_cookie()
+                except Exception:
+                    pass
+                continue
+            if e.code in (429, 502, 503) and i < attempts:
+                time.sleep(_RETRY_DELAY * (i + 1))
+                continue
+            raise
         except _RETRYABLE as e:
             last_err = e
             if i < attempts:
@@ -83,12 +158,45 @@ def get_or_create_session():
     return ""
 
 
-def get_latest_seq(sid):
-    r = _call("session.history", {"sessionId": sid, "maxMessages": 5})
-    events = r.get("result", {}).get("value", {}).get("events", [])
-    if events:
-        return events[-1].get("event", {}).get("seq", 0)
+def get_cursor(sid):
+    """当前事件游标（asOfSeq）。0.2.1 正路：session/projections。"""
+    r = _call("session/projections", {"sessionId": sid}, timeout=15, retry=1)
+    result = r.get("result", {})
+    if result.get("ok"):
+        return result.get("value", {}).get("asOfSeq", 0) or 0
     return 0
+
+
+def get_latest_seq(sid):
+    """兼容旧接口名：返回当前游标 seq。"""
+    return get_cursor(sid)
+
+
+def get_events(sid, max_messages=50, through_seq=None):
+    """拉一段历史事件（message-aligned 倒序页）。
+
+    0.2.1：session.history 已移除，改 projections(游标)+page。
+    返回与旧版相同结构的列表：[{"event":{type,seq,data,...}}, ...]（升序）。
+    """
+    if through_seq is None:
+        through_seq = get_cursor(sid)
+        if through_seq <= 0:
+            return []
+    r = _call("session.page", {
+        "address": {"kind": "session", "sessionId": sid},
+        "throughSeq": through_seq,
+        "maxMessages": max_messages,
+    }, timeout=30, retry=1)
+    result = r.get("result", {})
+    if not result.get("ok"):
+        return []
+    records = result.get("value", {}).get("records", [])
+    events = []
+    for rec in records:
+        ev = rec.get("event") or rec
+        events.append(rec if rec.get("event") else {"event": rec})
+    events.sort(key=lambda x: x.get("event", {}).get("seq", 0))
+    return events
 
 
 SYSTEM_CONSTRAINT = (
@@ -134,6 +242,7 @@ def send_message(text, timeout=180, wait_reply=True):
         return False, "无法创建/获取 DSH 会话"
 
     r = _call("session.prompt", {
+        "requestId": "fb-" + uuid.uuid4().hex[:16],
         "sessionId": sid,
         "mode": "queue",
         "content": [{"type": "text", "text": text}],
@@ -144,13 +253,12 @@ def send_message(text, timeout=180, wait_reply=True):
     if not wait_reply:
         return True, ""
 
-    before_seq = get_latest_seq(sid)
+    before_seq = get_cursor(sid)
 
     deadline = time.time() + timeout
     while time.time() < deadline:
         time.sleep(3)
-        r = _call("session.history", {"sessionId": sid, "maxMessages": 50})
-        events = r.get("result", {}).get("value", {}).get("events", [])
+        events = get_events(sid, max_messages=50)
         for item in events:
             ev = item.get("event", {})
             if ev.get("type") == "assistant/message" and ev.get("seq", 0) > before_seq:
@@ -180,4 +288,3 @@ def extract_question(reply):
     if idx >= 0:
         return reply[idx + len(QUESTION_MARK):].strip()
     return reply
-
