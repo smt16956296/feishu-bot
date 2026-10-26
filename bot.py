@@ -522,7 +522,13 @@ def group_summary_job() -> None:
         body = group_summary.build_all_summaries(day)
 
         if not body:
-            logger.info("今日所有群均无消息，跳过推送")
+            # 2026-10-26 按用户要求：无消息也发一条简短提示，而不是静默跳过
+            if REPORT_TARGET_OPEN_ID:
+                send_text_to_user(
+                    REPORT_TARGET_OPEN_ID,
+                    "【群聊日报】%s\n今日各群无消息，安静的一天喵～" % day,
+                )
+            logger.info("今日所有群均无消息，已推送安静提示")
             return
 
         if not REPORT_TARGET_OPEN_ID:
