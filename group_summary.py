@@ -129,7 +129,12 @@ def save_targets(targets: list) -> None:
 # ---------------- 总结生成 ----------------
 
 def collect_group_messages(chat_id: str, day: str) -> list:
-    """取某天某群的全部消息，并把发送者转成姓名。"""
+    """取某天某群的全部消息，并把发送者转成姓名。
+
+    2026-10-27 修复：按 ts 实际日期过滤——chat_context --sync 补拉会把跨天
+    历史写进当天文件（当天 bot 崩溃补消息时发生），旧逻辑只按 chat_id 过滤
+    导致日报混入好几天前的消息。现在只认 ts 落在目标当天的消息。
+    """
     msgs = get_messages(day)
     group_msgs = [m for m in msgs if (m.get("chat_id") or "") == chat_id]
     if not group_msgs:
@@ -140,9 +145,11 @@ def collect_group_messages(chat_id: str, day: str) -> list:
         ts = m.get("ts")
         try:
             dt = datetime.fromtimestamp(int(ts) / 1000)
+            if dt.strftime("%Y-%m-%d") != day:
+                continue  # 跨天旧消息（补拉混入），不进日报
             tstr = dt.strftime("%H:%M")
         except (ValueError, TypeError, OSError):
-            tstr = ""
+            continue  # 时间戳异常的消息不可信，跳过
         out.append({
             "time": tstr,
             "sender": display_name(m.get("sender_id", ""), m.get("sender_name", "")),
