@@ -41,12 +41,21 @@ import dsh_bridge
 # 图片落盘目录（供 agent 分析，也便于事后取证）
 IMAGE_DIR = os.path.join(DATA_DIR, "images")
 
+# 心跳文件：看门狗通过它的 mtime 判断 bot 是否僵死（进程在但线程卡住也能发现）
+HEARTBEAT_FILE = os.path.join(DATA_DIR, "bot_heartbeat.txt")
+# PID 文件：看门狗靠它快速定位 bot 进程（查命令行太慢，不可用）
+PID_FILE = os.path.join(DATA_DIR, "bot_pid.txt")
+
+from logging.handlers import RotatingFileHandler  # noqa: E402
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("logs/bot.log", encoding="utf-8"),
+        # 轮转：单文件 10MB，保留 5 份，防止无限增长（2026-11-03 进程静默消失排查时发现）
+        RotatingFileHandler("logs/bot.log", maxBytes=10 * 1024 * 1024,
+                            backupCount=5, encoding="utf-8"),
     ],
 )
 logger = logging.getLogger("feishu-bot")
@@ -376,6 +385,9 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
                     ("push.py --to %s" % sender_id) if is_p2p
                     else ("push.py --chat %s" % record["chat_id"]),
                 )
+                # 引用回复：把这条消息的 message_id 带上，agent 推送时加 --reply 即可
+                # 让飞书显示"回复某某：xxx"的引用效果
+                src_header += "【引用回复】加 --reply %s 可让回复显示为引用这条消息\n" % record["message_id"]
                 text_for_agent = src_header + text_for_agent
                 # 在独立线程处理，避免阻塞消息接收
                 import threading as _th
@@ -564,12 +576,47 @@ def scheduler_loop() -> None:
         time.sleep(20)
 
 
+def heartbeat_loop() -> None:
+    """心跳：每 60 秒刷新 data/bot_heartbeat.txt 的 mtime。
+
+    看门狗不看"进程在不在"（进程僵死时它还在），而是看这个文件的更新时间。
+    超过 5 分钟没更新 = bot 卡死，强制重启。
+    """
+    while True:
+        try:
+            with open(HEARTBEAT_FILE, "w", encoding="utf-8") as f:
+                f.write(datetime.now().isoformat())
+        except OSError as e:
+            logger.warning("心跳写入失败: %s", e)
+        time.sleep(60)
+
+
+def write_pid() -> None:
+    """把当前 PID 写进文件，供看门狗快速定位（2026-11-03 加）。"""
+    try:
+        with open(PID_FILE, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+    except OSError as e:
+        logger.warning("PID 文件写入失败: %s", e)
+
+
+def clear_pid() -> None:
+    """退出时清掉 PID 文件，避免看门狗误判。"""
+    try:
+        if os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
+    except OSError:
+        pass
+
+
 def main() -> None:
     if not APP_ID or not APP_SECRET:
         logger.error("缺少 FEISHU_APP_ID / FEISHU_APP_SECRET，请检查 .env")
         return
 
     threading.Thread(target=scheduler_loop, daemon=True).start()
+    threading.Thread(target=heartbeat_loop, daemon=True).start()
+    write_pid()
 
     handler = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(on_message) \
@@ -591,6 +638,13 @@ def main() -> None:
         logger.info("收到退出信号，机器人已停止")
     except Exception as e:
         logger.exception("机器人异常退出: %s", e)
+    finally:
+        # 走到这里说明 ws_client.start() 返回了 = 长连接主循环结束，进程即将退出。
+        # 这是 2026-11-03 那次"日志无任何记录就消失"的关键补丁：
+        # 之前只记 except，正常返回（SDK 内部退出）时什么都不留。
+        logger.warning("ws_client.start() 已返回，机器人主循环结束，进程即将退出")
+        clear_pid()
+        os._exit(1)   # 非 0 退出码，让看门狗/启动脚本知道这是异常退出
 
 
 if __name__ == "__main__":

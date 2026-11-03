@@ -118,8 +118,11 @@ def _audit(kind: str, target: str, ok: bool, preview: str) -> None:
         pass
 
 
-def send(text: str, target: str = "") -> bool:
-    """发送文本消息。target 为空时用 .env 里的默认目标。"""
+def send(text: str, target: str = "", reply_to: str = "") -> bool:
+    """发送文本消息。target 为空时用 .env 里的默认目标。
+
+    reply_to 非空时作为"引用回复"发出去（飞书会显示被引用的原消息）。
+    """
     to = target or REPORT_TARGET_OPEN_ID
     if not to:
         print("[ERROR] 未指定接收人，且 .env 未配置 FEISHU_REPORT_TARGET", file=sys.stderr)
@@ -127,9 +130,68 @@ def send(text: str, target: str = "") -> bool:
     if not text or not text.strip():
         print("[ERROR] 消息内容为空", file=sys.stderr)
         return False
+    if reply_to:
+        ok = _send_reply(to, text, reply_to, is_chat=False)
+        _audit("text-reply", to, ok, text)
+        return ok
     ok = bot.send_text_to_user(to, text)
     _audit("text", to, ok, text)
     return ok
+
+
+def _send_reply(receive_id: str, text: str, reply_to: str, is_chat: bool) -> bool:
+    """发引用回复（私聊/群通用）。
+
+    关键坑（2026-11-03 实测）：
+      ❌ POST /im/v1/messages 里带 reply_message_id —— 飞书会静默忽略，
+         消息正常发出但 parent_id 为 None，客户端不显示引用效果。
+      ✅ 必须用专门的回复接口：POST /im/v1/messages/:message_id/reply
+         这个接口不需要 receive_id（目标由被回复消息决定），
+         发出的消息 parent_id 会被自动设置，客户端才显示引用。
+
+    另一个坑：lark-oapi 1.7.3 的 CreateMessageRequestBodyBuilder 没有
+    reply_message_id 方法，SDK 不支持引用回复，所以这里直接调 HTTP。
+    """
+    import urllib.error
+    import urllib.request
+
+    try:
+        req = urllib.request.Request(
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            data=json.dumps({"app_id": bot.APP_ID, "app_secret": bot.APP_SECRET}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            tok = json.loads(r.read()).get("tenant_access_token", "")
+        if not tok:
+            print("[WARN] 取 token 失败，回退普通消息", file=sys.stderr)
+            return bot.send_text_to_user(receive_id, text)
+
+        # 正确的回复接口：/im/v1/messages/<被回复的 message_id>/reply
+        url = "https://open.feishu.cn/open-apis/im/v1/messages/%s/reply" % reply_to
+        payload = {
+            "msg_type": "text",
+            "content": json.dumps({"text": text}, ensure_ascii=False),
+        }
+        req2 = urllib.request.Request(
+            url, data=json.dumps(payload, ensure_ascii=False).encode(),
+            headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req2, timeout=20) as r:
+            d = json.loads(r.read())
+        if d.get("code") != 0:
+            print("[WARN] 引用回复失败 code=%s msg=%s，回退普通消息"
+                  % (d.get("code"), d.get("msg")), file=sys.stderr)
+            return bot.send_text_to_user(receive_id, text)
+        return True
+    except urllib.error.HTTPError as e:
+        print("[WARN] 引用回复 HTTP %s，回退普通消息: %s"
+              % (e.code, e.read().decode()[:150]), file=sys.stderr)
+        return bot.send_text_to_user(receive_id, text)
+    except Exception as e:
+        print("[ERROR] 引用回复异常: %s，回退普通消息" % e, file=sys.stderr)
+        return bot.send_text_to_user(receive_id, text)
 
 
 def send_rich(title: str, text: str, target: str = "") -> bool:
@@ -174,16 +236,26 @@ def send_rich(title: str, text: str, target: str = "") -> bool:
     return ok
 
 
-def send_to_chat(chat_id: str, text: str, title: str = "", at_list: list = None) -> bool:
+def send_to_chat(chat_id: str, text: str, title: str = "", at_list: list = None,
+                 reply_to: str = "") -> bool:
     """发送消息到群（chat_id 以 oc_ 开头）。
 
     at_list 非空时用富文本(post)发真实 @；否则纯文本。
+    reply_to 非空时作为"引用回复"发出去（飞书会显示被引用的原消息）。
     """
     if not chat_id or not text.strip():
         print("[ERROR] chat_id 或内容为空", file=sys.stderr)
         return False
 
     at_list = at_list or []
+
+    # 引用回复：走专门的 /reply 接口（见 _send_reply 注释里的坑）
+    if reply_to:
+        if at_list:
+            print("[WARN] 引用回复暂不支持同时 @，已忽略 --at", file=sys.stderr)
+        ok = _send_reply(chat_id, text, reply_to, is_chat=True)
+        _audit("group-text-reply", chat_id, ok, text)
+        return ok
 
     if at_list:
         # 真实 @ 必须用 post 消息
@@ -204,11 +276,11 @@ def send_to_chat(chat_id: str, text: str, title: str = "", at_list: list = None)
     try:
         from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 
-        body = (CreateMessageRequestBody.builder()
-                .receive_id(chat_id)
-                .msg_type(msg_type)
-                .content(json.dumps(payload, ensure_ascii=False))
-                .build())
+        builder = (CreateMessageRequestBody.builder()
+                   .receive_id(chat_id)
+                   .msg_type(msg_type)
+                   .content(json.dumps(payload, ensure_ascii=False)))
+        body = builder.build()
         req = (CreateMessageRequest.builder()
                .receive_id_type("chat_id")
                .request_body(body)
@@ -219,7 +291,7 @@ def send_to_chat(chat_id: str, text: str, title: str = "", at_list: list = None)
             print("[WARN] 群消息发送失败 code=%s msg=%s" % (resp.code, resp.msg), file=sys.stderr)
             # 富文本失败回退纯文本
             if title:
-                return send_to_chat(chat_id, "%s\n%s" % (title, text), "")
+                return send_to_chat(chat_id, "%s\n%s" % (title, text), "", reply_to=reply_to)
         _audit("group-" + msg_type, chat_id, ok, "%s | %s" % (title, text))
         return ok
     except Exception as e:
@@ -235,6 +307,7 @@ def main() -> int:
     parser.add_argument("--title", default="", help="标题（提供则发富文本）")
     parser.add_argument("--file", default="", help="从 UTF-8 文件读正文（避免中文编码问题）")
     parser.add_argument("--at", default="", help="要 @ 的人，姓名或 open_id，逗号分隔（自动转真实 @）")
+    parser.add_argument("--reply", default="", help="引用回复：被回复消息的 message_id（om_ 开头），飞书会显示原消息")
     args = parser.parse_args()
 
     if args.file:
@@ -264,11 +337,11 @@ def main() -> int:
                 print("[WARN] 无法解析 @%s 的 open_id，将作为纯文本处理" % raw, file=sys.stderr)
 
     if args.chat:
-        ok = send_to_chat(args.chat, text, args.title, at_list)
+        ok = send_to_chat(args.chat, text, args.title, at_list, reply_to=args.reply)
     elif args.title:
         ok = send_rich(args.title, text, args.to)
     else:
-        ok = send(text, args.to)
+        ok = send(text, args.to, reply_to=args.reply)
 
     if ok:
         print("OK")
