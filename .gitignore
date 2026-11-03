@@ -5,3 +5,5 @@ logs/
 data/
 tmp_*.txt
 tmp_*.py
+tmp_*/
+
