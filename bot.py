@@ -34,9 +34,23 @@ from config import (
     GROUP_SUMMARY_TIME,
     REPORT_TARGET_OPEN_ID,
 )
-from storage import append_message
-from reporter import build_daily_report
 import dsh_bridge
+
+# ── 可选业务模块 ──────────────────────────────────────────────────────
+# storage/reporter/group_summary 等是本机业务逻辑（消息流水、日报、群总结），
+# 不属于飞书桥接的通用部分，放在 local/ 下不进公开仓库。
+# 缺失时自动降级：消息照常收发，只是不做流水归档和日报。
+try:
+    from storage import append_message
+except ImportError:
+    def append_message(msg):  # noqa: D103
+        pass
+
+try:
+    from reporter import build_daily_report
+except ImportError:
+    def build_daily_report(day=None):  # noqa: D103
+        return ""
 
 # 图片落盘目录（供 agent 分析，也便于事后取证）
 IMAGE_DIR = os.path.join(DATA_DIR, "images")

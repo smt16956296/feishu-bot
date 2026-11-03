@@ -7,3 +7,13 @@ tmp_*.txt
 tmp_*.py
 tmp_*/
 
+# 业务逻辑（消息流水/日报/群总结），本地保留，不进公开仓库
+local/
+group_summary.py
+daily_summary.py
+classifier.py
+storage.py
+reporter.py
+name_map.py
+chat_context.py
+
