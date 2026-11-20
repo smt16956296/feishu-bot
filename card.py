@@ -10,6 +10,11 @@
     py -3 -X utf8 card.py --id om_xxx --text "新内容"                        # 更新已有卡片
     py -3 -X utf8 card.py --id om_xxx --done "结论内容"                      # 标记完成（变绿）
 
+    # 发表格（卡片 2.0，原生 table 组件）
+    py -3 -X utf8 card.py --chat oc_xxx --title "" --md --file 内容.md
+    py -3 -X utf8 card.py --chat oc_xxx --title "" --md --plain-table --file 内容.md
+    py -3 -X utf8 card.py --chat oc_xxx --title "标题" --md --row-height middle --file 内容.md
+
 用法（Python 代码，长任务推荐）：
     from card import ProgressCard
     card = ProgressCard("oc_xxx", "现场问题分析")
@@ -18,10 +23,37 @@
     # 出错时：
     card.fail("日志文件不存在")
 
+用法（Python 代码，发表格）：
+    from card import build_card_v2, send_card
+    send_card(build_card_v2("", "| 组 | 人数 |\n| --- | --- |\n| 1组 | 8 |"), "oc_xxx")
+
+------------------------------------------------------------ 表格渲染（2026-11-05 定型）
+两代卡片构造器，选哪个取决于要不要表格：
+    build_card(...)      卡片 1.0，lark_md 正文。**不支持表格**，纯文本用这个最省事。
+    build_card_v2(...)   卡片 2.0，正文 markdown + 原生 table 组件。要表格必须用这个。
+
+build_card_v2 的表格处理（native_table=True，命令行 --md 默认）：
+    1. _split_md_tables() 把正文里的 GFM 表格（| a | b | + |---|---| 分隔线）
+       切出来，其余文本仍走 markdown 元素；
+    2. _table_element() 转成 2.0 原生 table 组件：
+       · 列宽 = _col_width() 按内容实测估算（中文/全角 14px、ASCII 7.5px，
+         取表头与最长单元格的较大值 + 32px 内边距，夹在 80~600px）；
+         **不能写 width:"auto"——飞书多列时 auto 会均分成等宽，短列被撑满很难看**；
+       · 整列都是数字则 data_type=number + 右对齐，否则 text；
+       · header_style 灰底加粗、row_height 默认 auto、超过 10 行自动 page_size=10。
+    --plain-table 可退回「整段丢给 markdown 元素」的朴素渲染。
+
+要不要卡片头：
+    --title 传非空 → 带 header（左侧色块 + 大标题），适合任务进度/告警；
+    --title ""      → 不渲染 header，标题写进正文加粗行，观感接近普通富文本消息。
+
 ⚠️ 飞书限制：
     · 只有卡片消息（msg_type=interactive）能被 PATCH 编辑，纯文本不行（报 230001 NOT a card）
     · 每次更新都是全量替换，不是增量
     · 更新频率别太高，按里程碑更新（一次长任务 3-5 次足够），狂刷会被限流
+    · schema 2.0 不支持 note / hr 元素（报 200861），footer 用 markdown 行 + --- 实现
+    · table 组件只能放 body.elements 顶层，不能被容器嵌套；单卡最多 5 个 table
+    · 表格样式调整先私聊发测试卡验证，**确认后再发群**，别一次发两版（2026-11-05 教训）
 """
 import argparse
 import json
@@ -107,6 +139,206 @@ def build_card(title: str, body: str, color: str = BLUE, footer: str = "",
         },
         "elements": elements,
     }
+
+
+def _split_md_tables(md: str):
+    """把 markdown 文本拆成 [('md', 文本) / ('table', {'header':[...], 'rows':[[...]]})] 序列。
+
+    识别标准 GFM 表格：连续 >=2 行，首行为表头，第二行是 |---|---| 分隔线。
+    """
+    import re
+
+    lines = md.split("\n")
+    out = []
+    buf = []
+    i = 0
+    sep_re = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
+
+    def _cells(line):
+        s = line.strip()
+        if s.startswith("|"):
+            s = s[1:]
+        if s.endswith("|"):
+            s = s[:-1]
+        return [c.strip() for c in s.split("|")]
+
+    while i < len(lines):
+        line = lines[i]
+        is_tbl = (
+            "|" in line
+            and i + 1 < len(lines)
+            and "|" in lines[i + 1]
+            and sep_re.match(lines[i + 1])
+        )
+        if not is_tbl:
+            buf.append(line)
+            i += 1
+            continue
+        # 命中表格：先冲掉缓冲的 markdown
+        if buf:
+            txt = "\n".join(buf).strip("\n")
+            if txt.strip():
+                out.append(("md", txt))
+            buf = []
+        header = _cells(line)
+        i += 2
+        rows = []
+        while i < len(lines) and "|" in lines[i] and lines[i].strip():
+            rows.append(_cells(lines[i]))
+            i += 1
+        out.append(("table", {"header": header, "rows": rows}))
+    if buf:
+        txt = "\n".join(buf).strip("\n")
+        if txt.strip():
+            out.append(("md", txt))
+    return out
+
+
+def _col_width(header_cell, vals, min_px=80, max_px=600):
+    """按内容长度估算列宽（px）。
+
+    飞书 table 的 width:auto 在多列场景下会均分（每列等宽），
+    短列（小组/人数）也被撑满很难看，所以这里按字符宽度实测估算：
+      中文/全角字符 ≈ 14px，ASCII ≈ 7.5px，再留 32px 内边距，取最长行。
+    结果夹在 [min_px, max_px]，保证短列收缩、长列（成员名单）变宽。
+    """
+    def _text_px(s):
+        s = str(s)
+        width = 0.0
+        for ch in s:
+            width += 14.0 if ord(ch) > 0x2E7F else 7.5
+        return width
+
+    longest = _text_px(header_cell or "")
+    for v in vals:
+        longest = max(longest, _text_px(v))
+    px = int(longest + 32)
+    return max(min_px, min(max_px, px))
+
+
+def _table_element(header, rows, row_height="auto", header_bg="grey"):
+    """用卡片 2.0 原生 table 组件渲染表格（按内容分配列宽 + 表头样式）。"""
+    cols = []
+    for idx, name in enumerate(header):
+        # 该列是否全是数字（决定右对齐 + number 类型）
+        vals = [r[idx] if idx < len(r) else "" for r in rows]
+        numeric = all(v.replace(".", "", 1).replace("-", "", 1).isdigit() for v in vals if v)
+        cols.append({
+            "name": "c%d" % idx,
+            "display_name": name or " ",
+            "data_type": "number" if numeric and any(vals) else "text",
+            "width": "%dpx" % _col_width(name, vals),
+            "horizontal_align": "right" if numeric and any(vals) else "left",
+        })
+    data = []
+    for r in rows:
+        row = {}
+        for idx, c in enumerate(cols):
+            v = r[idx] if idx < len(r) else ""
+            if c["data_type"] == "number":
+                try:
+                    row[c["name"]] = float(v)
+                except ValueError:
+                    row[c["name"]] = v
+            else:
+                row[c["name"]] = v
+        data.append(row)
+    el = {
+        "tag": "table",
+        "columns": cols,
+        "rows": data,
+        "row_height": row_height,
+        "header_style": {"background_style": header_bg, "bold": True},
+    }
+    if len(data) > 10:
+        el["page_size"] = 10
+    return el
+
+
+def _md_table_to_html(header, rows) -> str:
+    """把表格转成 markdown 元素里可渲染的 HTML table（带内联样式）。
+
+    为什么要这么做：卡片消息在手机上永远是白底气泡，跟普通富文本（灰底）不同；
+    而 markdown 元素支持部分 HTML 标签，用 <table> 就能在「看起来像普通消息」的前提下
+    仍然拿到带表头底色、按内容分列宽的表格。
+    """
+    def _esc(s):
+        return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+    widths = [_col_width(header[i] if i < len(header) else "",
+                         [r[i] if i < len(r) else "" for r in rows])
+              for i in range(len(header))]
+    total = max(1, sum(widths))
+    parts = ['<table style="width:100%;border-collapse:collapse;font-size:13px;">']
+    parts.append("<thead><tr>")
+    for i, h in enumerate(header):
+        pct = max(6, round(widths[i] * 100 / total))
+        parts.append(
+            '<th style="width:%d%%;background-color:#F2F3F5;font-weight:bold;'
+            'text-align:left;padding:6px 8px;border-bottom:1px solid #DEE0E3;">%s</th>'
+            % (pct, _esc(h))
+        )
+    parts.append("</tr></thead><tbody>")
+    for r in rows:
+        parts.append("<tr>")
+        for i in range(len(header)):
+            v = r[i] if i < len(r) else ""
+            vals = [x[i] if i < len(x) else "" for x in rows]
+            numeric = all(x.replace(".", "", 1).replace("-", "", 1).isdigit()
+                          for x in vals if x)
+            align = "right" if numeric and any(vals) else "left"
+            parts.append(
+                '<td style="text-align:%s;padding:6px 8px;'
+                'border-bottom:1px solid #EFF0F1;">%s</td>' % (align, _esc(v))
+            )
+        parts.append("</tr>")
+    parts.append("</tbody></table>")
+    return "".join(parts)
+
+
+def build_card_v2(title: str, body_md: str, color: str = BLUE, footer: str = "",
+                   emoji: str = "📋", native_table: bool = True,
+                   row_height: str = "auto", header_bg: str = "grey",
+                   html_table: bool = False) -> dict:
+    """构造飞书卡片 JSON 2.0（schema 2.0）。
+
+    与 build_card（1.0）的区别：1.0 的 lark_md 不支持表格，2.0 才行。
+    2.0 下有两种表格渲染：
+      · native_table=True （默认）：解析 markdown 里的 GFM 表格，转成 2.0 原生
+        table 组件——列宽自适应（width:auto）、表头灰底加粗、行高自适应、>10 行自动分页。
+      · native_table=False：整段丢给 markdown 元素，靠 GFM 表格语法渲染（样式朴素）。
+
+    title   : 卡片标题；传空串 = 不渲染卡片头（仿普通富文本观感）
+    body_md : 正文 markdown（支持表格、加粗、列表、\n 等）
+    color   : 头部配色 blue/green/red/orange
+    footer  : 底部小字
+    emoji   : 标题前图标
+    """
+    elements = []
+    if title:
+        elements.append({"tag": "markdown", "content": "**%s**" % title})
+
+    if native_table:
+        for kind, payload in _split_md_tables(body_md):
+            if kind == "md":
+                elements.append({"tag": "markdown", "content": payload})
+            else:
+                elements.append(_table_element(payload["header"], payload["rows"],
+                                               row_height, header_bg))
+    else:
+        elements.append({"tag": "markdown", "content": body_md})
+
+    if footer:
+        # schema 2.0 已不支持 note 元素（200861），底部小字改用 markdown 行
+        elements.append({"tag": "markdown", "content": "---\n<font color='grey'>%s</font>" % footer})
+    card = {
+        "schema": "2.0",
+        "config": {"update_multi": True},
+        "body": {"elements": elements},
+    }
+    if not title:
+        card["config"]["wide_screen_mode"] = True
+    return card
 
 
 def send_card(card: dict, target: str, is_chat: bool = True) -> str:
@@ -304,6 +536,12 @@ def main() -> int:
     ap.add_argument("--file", help="从 UTF-8 文件读正文（中文长文本推荐）")
     ap.add_argument("--done", help="更新已有卡片为完成态，值为结果内容")
     ap.add_argument("--fail", help="更新已有卡片为失败态，值为失败原因")
+    ap.add_argument("--md", action="store_true",
+                    help="正文按卡片 2.0 渲染（markdown + 原生表格组件）")
+    ap.add_argument("--plain-table", action="store_true",
+                    help="表格走 markdown 语法渲染，不用原生 table 组件")
+    ap.add_argument("--row-height", default="auto",
+                    help="表格行高 low/middle/high/auto 或 [32,124]px，默认 auto")
     ap.add_argument("--color", default=BLUE, choices=[BLUE, GREEN, RED, ORANGE])
     ap.add_argument("--footer", default="", help="底部小字")
     args = ap.parse_args()
@@ -334,7 +572,12 @@ def main() -> int:
     if not body:
         print("[ERROR] 需要 --text 或 --file", file=sys.stderr)
         return 1
-    card = build_card(args.title, body, args.color, args.footer)
+    if args.md:
+        card = build_card_v2(args.title, body, args.color, args.footer,
+                             native_table=not args.plain_table,
+                             row_height=args.row_height)
+    else:
+        card = build_card(args.title, body, args.color, args.footer)
     mid = send_card(card, target, is_chat=bool(args.chat))
     if mid:
         print("OK %s" % mid)
