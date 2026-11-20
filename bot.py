@@ -332,6 +332,19 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
         # 是否 @ 了机器人自己
         at_bot = any(m["name"] and BOT_NAME and BOT_NAME in m["name"] for m in mentions)
 
+        chat_type = getattr(message, "chat_type", "") or ""
+
+        # 是否 @ 了"关注的人"（默认沈梦婷）：别人 @ 她时也唤醒机器人
+        # 只在群聊生效，且排除机器人自己发的消息，避免自我触发死循环
+        at_watched = False
+        try:
+            from config import WATCH_OPEN_IDS
+        except Exception:
+            WATCH_OPEN_IDS = []
+        if WATCH_OPEN_IDS and chat_type == "group":
+            at_watched = any((m.get("open_id") or "") in WATCH_OPEN_IDS
+                             for m in mentions)
+
         sender_id = ""
         sender_name = "未知"
         sender = event.sender
@@ -342,7 +355,6 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
             if sender.sender_type == "user":
                 sender_name = resolve_user_name(sender_id)
 
-        chat_type = getattr(message, "chat_type", "") or ""
         record = {
             "message_id": message.message_id if message else "",
             "text": text,
@@ -354,6 +366,7 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
             "chat_type": chat_type,
             "mentions": mentions,
             "at_bot": at_bot,
+            "at_watched": at_watched,
             "msg_type": msg_type,
             "images": local_images,
         }
@@ -369,9 +382,9 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
             except Exception as e:
                 logger.warning("登记群失败: %s", e)
 
-        # 触发 agent：私聊 或 群里 @机器人 时走 agent 对话
+        # 触发 agent：私聊 或 群里 @机器人 或 别人@关注的人 时走 agent 对话
         is_p2p = (chat_type == "p2p")
-        if (is_p2p or at_bot) and sender_id:
+        if (is_p2p or at_bot or at_watched) and sender_id:
             text_for_agent = text.strip()
 
             # 强制附带最近上下文：用户说「@我」「看一下」这种短消息时，
@@ -402,6 +415,13 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
                 # 引用回复：把这条消息的 message_id 带上，agent 推送时加 --reply 即可
                 # 让飞书显示"回复某某：xxx"的引用效果
                 src_header += "【引用回复】加 --reply %s 可让回复显示为引用这条消息\n" % record["message_id"]
+                # 2026-11-19：非 @机器人 触发（别人 @ 了关注的人）时，提示 agent
+                # 判断是否该介入，避免抢话刷屏
+                if at_watched and not at_bot:
+                    src_header += ("【触发方式】本条消息未 @ 你，是别人 @ 了沈梦婷触发的唤醒。"
+                                   "先判断是否与你职责相关（项目问题、记录、待办、她需要你出面的信息）："
+                                   "相关则正常处理；无关（纯闲聊、他人私事、已由他人明确回答）"
+                                   "则只记录、不要推送任何消息。\n")
                 text_for_agent = src_header + text_for_agent
                 # 在独立线程处理，避免阻塞消息接收
                 import threading as _th
@@ -410,7 +430,8 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
                 with _pending_lock:
                     is_replying = _pending_questions.get(sender_id, False)
                 t = _th.Thread(target=handle_agent_reply,
-                               args=(record['chat_id'], chat_type, sender_id, text_for_agent, msg_id, is_replying),
+                               args=(record['chat_id'], chat_type, sender_id, text_for_agent, msg_id, is_replying,
+                                     bool(is_p2p or at_bot)),
                                daemon=True)
                 t.start()
     except Exception as e:
@@ -418,7 +439,7 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
 
 
 
-def handle_agent_reply(chat_id, chat_type, sender_id, text, message_id, is_replying=False):
+def handle_agent_reply(chat_id, chat_type, sender_id, text, message_id, is_replying=False, react=True):
     """把消息投递给 DSH agent（在独立线程中运行）。
 
     2026-10-22 改版：不再等待/转发 agent 回复。旧逻辑有两大缺陷：
@@ -427,10 +448,14 @@ def handle_agent_reply(chat_id, chat_type, sender_id, text, message_id, is_reply
        与 agent 自己的 push 推送重复（用户看到两遍）。
     现在只负责：贴"收到"表情 → 消息入队 → 投递失败时通知用户。
     agent 处理完成后自行用 push.py 把完整回复推送到消息来源（群 --chat / 私聊 --to）。
+
+    2026-11-20：react=False 时不贴"收到"表情（别人 @ 沈梦婷触发、未 @ 机器人时，
+    避免机器人在无关消息上刷存在感；@ 机器人或私聊时才贴）。
     """
     try:
-        add_reaction(message_id, "SALUTE")
-        logger.info("已贴收到表情")
+        if react:
+            add_reaction(message_id, "SALUTE")
+            logger.info("已贴收到表情")
 
         ok2, err = dsh_bridge.send_message(text, timeout=180, wait_reply=False)
         if not ok2:

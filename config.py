@@ -37,3 +37,11 @@ REPORT_TARGET_OPEN_ID = os.getenv("FEISHU_REPORT_TARGET", "")
 
 DATA_DIR = os.path.join(BASE_DIR, "data")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
+
+# 2026-11-19：别人 @ 这些人时也唤醒机器人（关注人唤醒）
+# 逗号分隔 open_id；从 .env 的 FEISHU_WATCH_OPEN_IDS 读取，缺省为空=关闭该触发方式
+WATCH_OPEN_IDS = [
+    x.strip()
+    for x in os.getenv("FEISHU_WATCH_OPEN_IDS", "").split(",")
+    if x.strip()
+]
