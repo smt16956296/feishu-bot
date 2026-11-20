@@ -17,3 +17,6 @@ reporter.py
 name_map.py
 chat_context.py
 
+
+# PPT 素材不进仓库
+docs/ppt/
