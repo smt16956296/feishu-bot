@@ -118,6 +118,70 @@ def _audit(kind: str, target: str, ok: bool, preview: str) -> None:
         pass
 
 
+def split_bubbles(text: str) -> list:
+    """把一段长回复拆成多个气泡（模拟真人分条发消息）。
+
+    拆分规则（2026-11-16 沈梦婷要求"分多个气泡、简明扼要"）：
+      1. 优先用显式分隔符 ---气泡--- / ---SPLIT---（整行匹配）
+      2. 否则按空行（连续两个换行）切块
+      3. 每个气泡超过 MAX_BUBBLE 字时，按句子边界再切，避免单条太长
+      4. 最多 MAX_BUBBLES 条，超出的合并到最后一个气泡
+    """
+    import re as _re
+
+    MAX_BUBBLE = 260
+    MAX_BUBBLES = 6
+
+    raw = text.replace("\r\n", "\n")
+    # 1) 显式分隔符
+    if _re.search(r"^\s*-{2,}\s*(气泡|SPLIT|split)\s*-{2,}\s*$", raw, _re.M):
+        parts = _re.split(r"^\s*-{2,}\s*(?:气泡|SPLIT|split)\s*-{2,}\s*$", raw, flags=_re.M)
+    else:
+        # 2) 空行分块
+        parts = _re.split(r"\n\s*\n", raw)
+
+    bubbles = []
+    for p in parts:
+        p = p.strip("\n").strip()
+        if not p:
+            continue
+        # 3) 过长再按句子切
+        if len(p) <= MAX_BUBBLE:
+            bubbles.append(p)
+            continue
+        sents = _re.split(r"(?<=[。！？!?；;\n])", p)
+        cur = ""
+        for s in sents:
+            if not s:
+                continue
+            if cur and len(cur) + len(s) > MAX_BUBBLE:
+                bubbles.append(cur.strip())
+                cur = s
+            else:
+                cur += s
+        if cur.strip():
+            bubbles.append(cur.strip())
+
+    # 4) 合并超额
+    if len(bubbles) > MAX_BUBBLES:
+        head = bubbles[:MAX_BUBBLES - 1]
+        tail = "\n\n".join(bubbles[MAX_BUBBLES - 1:])
+        bubbles = head + [tail]
+
+    return bubbles or [text.strip()]
+
+
+def _looks_multi(text: str) -> bool:
+    """正文是否适合拆成多个气泡：含显式分隔符，或含空行且整体不算太短。"""
+    import re as _re
+
+    t = (text or "").replace("\r\n", "\n")
+    if _re.search(r"^\s*-{2,}\s*(?:气泡|SPLIT|split)\s*-{2,}\s*$", t, _re.M):
+        return True
+    # 至少一个空行分块，且正文超过 60 字（太短的问候不拆）
+    return bool(_re.search(r"\n\s*\n", t)) and len(t.strip()) > 60
+
+
 def send(text: str, target: str = "", reply_to: str = "") -> bool:
     """发送文本消息。target 为空时用 .env 里的默认目标。
 
@@ -137,6 +201,38 @@ def send(text: str, target: str = "", reply_to: str = "") -> bool:
     ok = bot.send_text_to_user(to, text)
     _audit("text", to, ok, text)
     return ok
+
+
+def send_bubbles(parts: list, target: str = "", is_chat: bool = False,
+                 reply_to: str = "", delay: float = 0.45) -> bool:
+    """把多个气泡依次发出，模拟真人分条发消息。
+
+    第一条带 --reply 引用（群里只引用一次，后续不重复引用）；
+    每条之间 delay 秒间隔，避免飞书合并或限流。
+    """
+    import time
+
+    if not parts:
+        return False
+    # 修复 2026-11-16：私聊时 send() 的 target 参数此前漏传，导致每条气泡都用
+    # .env 的默认目标；默认目标为空时飞书报错、个别情况下会把 open_id 当正文发出。
+    to = target or REPORT_TARGET_OPEN_ID
+    if not to:
+        print("[ERROR] 未指定接收人，且 .env 未配置 FEISHU_REPORT_TARGET", file=sys.stderr)
+        return False
+    all_ok = True
+    for i, p in enumerate(parts):
+        if i > 0 and delay:
+            time.sleep(delay)
+        if is_chat:
+            ok = send_to_chat(target, p, "", [], reply_to=reply_to if i == 0 else "")
+        else:
+            ok = send(p, to, reply_to=reply_to if i == 0 else "")
+        if not ok:
+            all_ok = False
+            print("[WARN] 第 %d/%d 个气泡发送失败" % (i + 1, len(parts)), file=sys.stderr)
+    return all_ok
+
 
 
 def _send_reply(receive_id: str, text: str, reply_to: str, is_chat: bool) -> bool:
@@ -194,6 +290,115 @@ def _send_reply(receive_id: str, text: str, reply_to: str, is_chat: bool) -> boo
         return bot.send_text_to_user(receive_id, text)
 
 
+def md_to_post_nodes(md: str) -> list:
+    """把 markdown 文本转成飞书 post（富文本）的节点数组。
+
+    飞书 post 支持的节点（官方 im/v1/messages msg_type=post）：
+        {"tag":"text","text":"..."}                      纯文本
+        {"tag":"a","text":"链接文字","href":"..."}        超链接
+        {"tag":"at","user_id":"ou_xxx","user_name":"名字"} @人
+        {"tag":"img","image_key":"img_xxx"}              图片
+        {"tag":"media","file_key":"..."}                 视频
+        {"tag":"emotion","emoji_type":"SMILE"}           表情
+        {"tag":"code_block","language":"PYTHON","text":"..."}  代码块
+    每个段落是一个节点数组，content = [段落1, 段落2, ...]。
+    **注意：post 不支持表格，也不支持 <font> 等 HTML 标签。**
+
+    这里解析的子集（够日常用）：
+        **加粗** / __加粗__     -> 用 text 节点原样保留标记会很难看，改为纯文本（见下）
+        [文字](url)            -> a 节点
+        @姓名                  -> 保持纯文本（真 @ 需要 open_id，见 push.py --at）
+        `代码`                 -> 保持纯文本
+    段落：按 \n 切分，空行保留为 {"tag":"text","text":""} 以维持间距。
+    """
+    import re
+
+    def _inline(seg: str) -> list:
+        nodes = []
+        pos = 0
+        # 只识别 [文字](url)；加粗在 post 里没有对应节点，去掉标记直接显示文字
+        for m in re.finditer(r"\[([^\]]+)\]\((https?://[^)]+)\)", seg):
+            if m.start() > pos:
+                nodes.extend(_plain(seg[pos:m.start()]))
+            nodes.append({"tag": "a", "text": m.group(1), "href": m.group(2)})
+            pos = m.end()
+        if pos < len(seg):
+            nodes.extend(_plain(seg[pos:]))
+        return nodes
+
+    def _plain(s: str) -> list:
+        if not s:
+            return []
+        # 去掉 markdown 加粗标记（post 无加粗节点，留着会显示成星号）
+        s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
+        s = re.sub(r"__(.+?)__", r"\1", s)
+        s = re.sub(r"^#{1,6}\s*", "", s)
+        s = re.sub(r"^-\s+", "· ", s)
+        return [{"tag": "text", "text": s}]
+
+    paragraphs = []
+    for line in md.split("\n"):
+        if line.strip() == "":
+            paragraphs.append([{"tag": "text", "text": ""}])
+        else:
+            paragraphs.append(_inline(line) or [{"tag": "text", "text": line}])
+    return paragraphs
+
+
+def send_post(target: str, md: str, title: str = "", is_chat: bool = False) -> bool:
+    """发送富文本（post）消息。灰底气泡，和普通消息同一种类型（非卡片）。
+
+    target: chat_id（is_chat=True）或 open_id
+    md    : markdown 文本，内部转成 post 节点（**加粗** 会被去掉标记，post 无加粗能力）
+    """
+    import urllib.error
+    import urllib.request
+
+    if not md.strip():
+        print("[ERROR] 富文本内容为空", file=sys.stderr)
+        return False
+    content = {
+        "zh_cn": {
+            "title": title or "",
+            "content": md_to_post_nodes(md),
+        }
+    }
+    try:
+        req = urllib.request.Request(
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            data=json.dumps({"app_id": bot.APP_ID, "app_secret": bot.APP_SECRET}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            tok = json.loads(r.read()).get("tenant_access_token", "")
+        if not tok:
+            print("[ERROR] 取 token 失败", file=sys.stderr)
+            return False
+        body = json.dumps({
+            "receive_id": target,
+            "msg_type": "post",
+            "content": json.dumps(content, ensure_ascii=False),
+        }, ensure_ascii=False)
+        url = ("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=%s"
+               % ("chat_id" if is_chat else "open_id"))
+        req2 = urllib.request.Request(
+            url, data=body.encode(),
+            headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req2, timeout=20) as r:
+            d = json.loads(r.read())
+        if d.get("code") != 0:
+            print("[WARN] 富文本发送失败 code=%s msg=%s" % (d.get("code"), d.get("msg")),
+                  file=sys.stderr)
+            return False
+        _audit("post", target, True, md)
+        return True
+    except Exception as e:
+        print("[ERROR] 富文本发送异常: %s" % e, file=sys.stderr)
+        return False
+
+
 def send_rich(title: str, text: str, target: str = "") -> bool:
     """发送带标题的富文本（post）消息；失败则回退为纯文本。"""
     to = target or REPORT_TARGET_OPEN_ID
@@ -234,6 +439,16 @@ def send_rich(title: str, text: str, target: str = "") -> bool:
     ok = bot.send_text_to_user(to, "%s\n%s" % (title, text) if title else text)
     _audit("post-fallback-text", to, ok, "%s | %s" % (title, text))
     return ok
+
+
+def send_file(receive_id: str, path: str, is_chat: bool = False) -> bool:
+    """上传文件到飞书并以文件消息发送。receive_id 为 open_id（私聊）或 chat_id（群）。
+
+    2026-11-20 实现已拆到 file.py（文件消息与文本/卡片差异大，单独成模块，
+    与 card.py / recall.py 对称）。这里保留同名包装，旧调用 push.send_file(...) 不断。
+    """
+    from file import send_file as _send_file
+    return _send_file(receive_id, path, is_chat=is_chat)
 
 
 def send_to_chat(chat_id: str, text: str, title: str = "", at_list: list = None,
@@ -308,6 +523,16 @@ def main() -> int:
     parser.add_argument("--file", default="", help="从 UTF-8 文件读正文（避免中文编码问题）")
     parser.add_argument("--at", default="", help="要 @ 的人，姓名或 open_id，逗号分隔（自动转真实 @）")
     parser.add_argument("--reply", default="", help="引用回复：被回复消息的 message_id（om_ 开头），飞书会显示原消息")
+    parser.add_argument("--post", action="store_true",
+                        help="以富文本(post)发送：灰底气泡、和普通消息同类，支持链接；不支持表格")
+    parser.add_argument("--bubbles", action="store_true",
+                        help="强制拆成多个气泡依次发送（按空行/---气泡---切分）")
+    parser.add_argument("--no-bubbles", action="store_true",
+                        help="强制不拆分，整段发一条")
+    parser.add_argument("--delay", type=float, default=0.45,
+                        help="气泡之间的间隔秒数（默认 0.45）")
+    parser.add_argument("--attach", default="",
+                        help="附带发送的文件路径（xlsx/pdf/zip 等）；可配合 --file 正文，先发文本再发文件")
     args = parser.parse_args()
 
     if args.file:
@@ -318,7 +543,7 @@ def main() -> int:
         if text == "-" or (not text and not sys.stdin.isatty()):
             text = sys.stdin.read()
 
-    if not text.strip():
+    if not text.strip() and not args.attach:
         parser.print_help()
         return 1
 
@@ -336,7 +561,43 @@ def main() -> int:
             else:
                 print("[WARN] 无法解析 @%s 的 open_id，将作为纯文本处理" % raw, file=sys.stderr)
 
-    if args.chat:
+    # 分气泡默认关闭（2026-11-16 沈梦婷反馈：自动拆分不如原来整段发好读）
+    #   需要时显式加 --bubbles 才拆
+    do_bubbles = args.bubbles and not args.no_bubbles
+
+    if args.attach:
+        if not os.path.isfile(args.attach):
+            print("[ERROR] --attach 文件不存在: %s" % args.attach, file=sys.stderr)
+            return 1
+        target = args.chat or args.to or REPORT_TARGET_OPEN_ID
+        is_chat = bool(args.chat)
+        ok = True
+        if text.strip():
+            ok = (send_to_chat(args.chat, text, args.title, at_list, reply_to=args.reply) if is_chat
+                  else send(text, args.to, reply_to=args.reply))
+        ok2 = send_file(target, args.attach, is_chat=is_chat)
+        if ok and ok2:
+            print("OK")
+            return 0
+        print("FAILED", file=sys.stderr)
+        return 1
+
+    if do_bubbles and not args.post and not args.title:
+        target = args.chat or args.to or REPORT_TARGET_OPEN_ID
+        if not target:
+            print("[ERROR] 分气泡需要 --chat 或 --to", file=sys.stderr)
+            return 1
+        parts = split_bubbles(text)
+        print("[INFO] 拆成 %d 个气泡" % len(parts), file=sys.stderr)
+        ok = send_bubbles(parts, target, is_chat=bool(args.chat),
+                          reply_to=args.reply, delay=args.delay)
+    elif args.post:
+        target = args.chat or args.to
+        if not target:
+            print("[ERROR] --post 需要 --chat 或 --to", file=sys.stderr)
+            return 1
+        ok = send_post(target, text, args.title, is_chat=bool(args.chat))
+    elif args.chat:
         ok = send_to_chat(args.chat, text, args.title, at_list, reply_to=args.reply)
     elif args.title:
         ok = send_rich(args.title, text, args.to)
