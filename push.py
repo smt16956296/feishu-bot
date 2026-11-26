@@ -535,6 +535,18 @@ def main() -> int:
                         help="附带发送的文件路径（xlsx/pdf/zip 等）；可配合 --file 正文，先发文本再发文件")
     args = parser.parse_args()
 
+    # 2026-11-26：--to 与 --chat 互斥校验。
+    # 背景：下方目标解析是 `args.chat or args.to or REPORT_TARGET_OPEN_ID`，
+    # --chat 优先级更高——命令里残留一个 --chat（比如从群发命令改来的），
+    # --to 会被静默忽略，消息直接发到群里且照样返回 OK，
+    # 这正是"嘴上说私聊、实际发到群"的技术成因。这里直接拒绝，不让它发出去。
+    if args.to and args.chat:
+        print("[ERROR] --to 和 --chat 不能同时使用：一条命令只能指定一个发送目标。"
+              "\n        私聊用 --to <open_id>；群聊用 --chat <chat_id>。"
+              "\n        请删掉多余的那个参数后重试（多半是从上一条命令复制粘贴残留）。",
+              file=sys.stderr)
+        return 2
+
     if args.file:
         with open(args.file, "r", encoding="utf-8") as f:
             text = f.read()
